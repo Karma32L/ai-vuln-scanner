@@ -1,14 +1,24 @@
 """Módulo de reconocimiento inicial: escaneo de puertos/versiones y cabeceras HTTP."""
 
 import ipaddress
+import os
 import re
 import shutil
+import socket
 import subprocess
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
+from typing import Self
 
 import httpx
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    HttpUrl,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 SECURITY_HEADERS = (
     "Content-Security-Policy",
@@ -16,6 +26,8 @@ SECURITY_HEADERS = (
     "X-Frame-Options",
     "X-Content-Type-Options",
 )
+
+DEFAULT_ALLOWED_HOSTS = "127.0.0.1"
 
 # Hostname RFC 1123: etiquetas alfanuméricas, guiones solo en el interior.
 # Impide que el host empiece por "-" y sea interpretado por nmap como una opción.
@@ -29,16 +41,41 @@ class ScannerError(Exception):
     """Error al ejecutar o interpretar el escaneo de nmap."""
 
 
+def _allowed_networks() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Lee SCAN_ALLOWED_HOSTS (IPs o CIDR separados por comas). Vacío = nada permitido."""
+    raw = os.getenv("SCAN_ALLOWED_HOSTS", DEFAULT_ALLOWED_HOSTS)
+    return [
+        ipaddress.ip_network(entry.strip(), strict=False)
+        for entry in raw.split(",")
+        if entry.strip()
+    ]
+
+
+def _resolve(host: str, port: int) -> str:
+    """Resuelve el host una única vez; nmap y httpx usarán esta misma IP."""
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise ValueError(f"no se pudo resolver {host!r}") from exc
+    return str(infos[0][4][0])
+
+
 class ScanTarget(BaseModel):
     """Objetivo validado. Es la única vía para que datos externos lleguen a nmap/httpx."""
 
     url: HttpUrl
+    _ip: str = PrivateAttr(default="")
 
     @field_validator("url")
     @classmethod
-    def validate_host(cls, value: HttpUrl) -> HttpUrl:
+    def validate_url(cls, value: HttpUrl) -> HttpUrl:
         if value.scheme not in ("http", "https"):
             raise ValueError("solo se permiten URLs http/https")
+        # Las credenciales acabarían en el reporte JSON y en la petición HTTP.
+        if value.username or value.password:
+            raise ValueError("la URL no debe contener credenciales")
+        if value.port == 0:
+            raise ValueError("el puerto 0 no es válido")
         host = (value.host or "").strip("[]")
         try:
             ipaddress.ip_address(host)
@@ -47,22 +84,34 @@ class ScanTarget(BaseModel):
                 raise ValueError(f"host no válido: {host!r}") from None
         return value
 
+    @model_validator(mode="after")
+    def resolve_and_authorize(self) -> Self:
+        # Se autoriza la IP resuelta, no el nombre: evita saltarse la lista vía DNS.
+        ip = _resolve(self.host, self.port)
+        ip_obj = ipaddress.ip_address(ip)
+        if not any(ip_obj in net for net in _allowed_networks()):
+            raise ValueError(f"{ip} no está en SCAN_ALLOWED_HOSTS")
+        self._ip = ip
+        return self
+
     @property
     def host(self) -> str:
         # Pydantic devuelve IPv6 entre corchetes; nmap los necesita sin ellos.
         return (self.url.host or "").strip("[]")
 
     @property
+    def ip(self) -> str:
+        return self._ip
+
+    @property
     def port(self) -> int:
-        # HttpUrl ya resuelve el puerto por defecto (80/443) si no se indica.
-        return self.url.port or (443 if self.url.scheme == "https" else 80)
+        if self.url.port is not None:
+            return self.url.port
+        return 443 if self.url.scheme == "https" else 80
 
     @property
     def is_ipv6(self) -> bool:
-        try:
-            return ipaddress.ip_address(self.host).version == 6
-        except ValueError:
-            return False
+        return ipaddress.ip_address(self.ip).version == 6
 
 
 class PortResult(BaseModel):
@@ -78,6 +127,7 @@ class HeaderAudit(BaseModel):
     status_code: int
     present: dict[str, str]
     missing: list[str]
+    redirect_location: str | None = None
 
 
 class ScanReport(BaseModel):
@@ -120,7 +170,7 @@ def run_nmap(target: ScanTarget, timeout: int = 120) -> list[PortResult]:
     cmd = ["nmap", "-sV", "-p", str(target.port), "-oX", "-"]
     if target.is_ipv6:
         cmd.append("-6")
-    cmd.append(target.host)
+    cmd.append(target.ip)
 
     try:
         proc = subprocess.run(
@@ -141,18 +191,43 @@ def run_nmap(target: ScanTarget, timeout: int = 120) -> list[PortResult]:
     return _parse_nmap_xml(proc.stdout)
 
 
-def audit_headers(target: ScanTarget, timeout: float = 10.0) -> HeaderAudit:
+def audit_headers(
+    target: ScanTarget,
+    timeout: float = 10.0,
+    transport: httpx.BaseTransport | None = None,
+) -> HeaderAudit:
     """Hace un GET y reporta qué cabeceras de seguridad están presentes o faltan."""
-    response = httpx.get(str(target.url), timeout=timeout, follow_redirects=True)
-    # httpx.Headers es case-insensitive, así que la comparación es directa.
-    present = {
-        name: response.headers[name]
-        for name in SECURITY_HEADERS
-        if name in response.headers
-    }
+    url = httpx.URL(str(target.url))
+    # Conecta a la IP ya autorizada; Host y SNI conservan el nombre original.
+    request_url = url.copy_with(host=target.ip)
+    # Sin seguir redirecciones: no se sale del objetivo autorizado.
+    # stream() evita descargar el cuerpo: solo interesan las cabeceras.
+    with (
+        httpx.Client(
+            timeout=timeout, follow_redirects=False, transport=transport
+        ) as client,
+        client.stream(
+            "GET",
+            request_url,
+            headers={"Host": url.netloc.decode()},
+            extensions={"sni_hostname": target.host},
+        ) as response,
+    ):
+        # httpx.Headers es case-insensitive, así que la comparación es directa.
+        present = {
+            name: response.headers[name]
+            for name in SECURITY_HEADERS
+            if name in response.headers
+        }
+        redirect = response.headers.get("Location") if response.is_redirect else None
+        status_code = response.status_code
+
     missing = [name for name in SECURITY_HEADERS if name not in present]
     return HeaderAudit(
-        status_code=response.status_code, present=present, missing=missing
+        status_code=status_code,
+        present=present,
+        missing=missing,
+        redirect_location=redirect,
     )
 
 

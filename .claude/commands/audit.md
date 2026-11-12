@@ -1,0 +1,1 @@
+Actúa como auditor senior de AppSec. Revisa los cambios recientes en `src/` buscando exposición de secretos, vulnerabilidades de inyección (SQLi, Command, Prompt) y falta de validación de entradas. Entrega un reporte breve por severidad sin modificar archivos todavía.

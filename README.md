@@ -113,7 +113,7 @@ sudo apt install nmap
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 2. Proyecto (uv crea el .venv e instala las versiones exactas de uv.lock)
-git clone <url-del-repo> ai-vuln-scanner && cd ai-vuln-scanner
+git clone https://github.com/Karma32L/ai-vuln-scanner.git ai-vuln-scanner && cd ai-vuln-scanner
 uv sync
 
 # 3. Configuración
@@ -224,6 +224,16 @@ $ echo $?
 
 ---
 
+## Laboratorio
+
+`lab/docker-compose.yml` levanta [OWASP Juice Shop](https://owasp.org/www-project-juice-shop/), una aplicación vulnerable a propósito. Solo escucha en `127.0.0.1:3000`, así que no queda expuesta a la red. Además, es el objetivo por defecto de la CLI y está dentro de la allowlist por defecto.
+
+```bash
+docker compose -f lab/docker-compose.yml up -d
+uv run python -m src.main --analyze      # escanea http://127.0.0.1:3000
+docker compose -f lab/docker-compose.yml down
+```
+
 ## Desarrollo
 
 ```bash
@@ -236,6 +246,5 @@ Los tests no necesitan red ni LLM: el tráfico HTTP se simula con `httpx.MockTra
 ## Limitaciones y trabajo futuro
 
 - Solo se escanea el puerto de la URL (`-p <port>`); no hay barrido de rangos.
-- `lab/docker-compose.yml` todavía está vacío. Falta definir un entorno vulnerable reproducible.
 - La CLI no carga `.env` automáticamente (hay que exportar las variables).
 - El parseo XML usa `xml.etree` porque el XML lo genera `nmap` en local. Si alguna vez se aceptara XML externo, habría que pasar a `defusedxml`.
